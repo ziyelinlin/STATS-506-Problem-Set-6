@@ -1,0 +1,155 @@
+---
+title: "STATS 506 Problem Set 6"
+author: "Lindsey Lin"
+format:
+  html:
+    embed-resources: true
+editor: visual
+---
+
+#### GitHub Repository Link:
+
+```{r}
+library(Rcpp)
+library(data.table)
+library(e1071)
+```
+
+## Problem 1 - Rcpp
+
+In the [notes](https://dept.stat.lsa.umich.edu/~jerrick/courses/stat506_f25/15-rcpp.html), we defined a `C_mean` function. Using this as a template, implement a `C_moment` function that returns the `k`th central moment. Generate a vector of moderate length and show that you are able to **replicate the results** of `e1071::moment`.
+
+Notes & Hints:
+
+-   Be cognizant of your scaling factor.
+
+-   Be sure to look at the arguments of `e1071::moment`.
+
+Computes the **k-th central moment**: $\mu_k = \frac{1}{n} \sum_{i=1}^n (x_i - \bar{x})^k$
+
+```{r}
+cppFunction("
+double C_moment(NumericVector v, int k) {
+  int n = v.length();
+  double mean = 0.0;
+  
+  for (int i = 0; i < n; ++i) {
+    mean += v[i];
+  }
+  mean = mean / n;
+
+  double total = 0.0;
+  for (int i = 0; i < n; ++i) {
+    total += pow(v[i] - mean, k);
+  }
+
+  return total / n;   
+}")
+```
+
+```{r}
+dist_list <- list(normal = rnorm(1000, mean = 2, sd = 3),
+                  uniform = runif(1000, min = -1, max = 4),
+                  poisson = rpois(1000, lambda = 3),
+                  exp = rexp(1000, rate = 2))
+
+lapply(dist_list, function(x) {c(C_moment = C_moment(x, 2), 
+                                 e1071 = e1071::moment(x, order = 2, center = TRUE))})
+```
+
+For vectors of 1,000 draws from several distributions (Normal, Uniform, Poisson, Exponential), `C_moment(x, 2)` matches `moment(x, order = 2, center = TRUE)` from the e1071 package.
+
+## Problem 2 - **Expanding on `waldCI`**
+
+## Problem 3 - **Large data**
+
+## Problem 4 - data.table
+
+Use the **data.table** for this problem. Use the [“ATP Matches” data](https://raw.githubusercontent.com/JeffSackmann/tennis_atp/refs/heads/master/atp_matches_2019.csv). This data tracks all Tennis matches. This data **does not have documentation**, so you’ll have to explore the data yourself to figure out it’s structure. Use it to answer the following questions. Your answers should show both the output from R that allows you to answer it, as well as a written answer.
+
+```{r}
+tennis <- fread("https://raw.githubusercontent.com/JeffSackmann/tennis_atp/refs/heads/master/atp_matches_2019.csv")
+```
+
+**a. How many tournaments took place in 2019?**
+
+Notes:
+
+I found each Davis Cup tie (e.g., "Davis Cup Finals RR: FRA vs JPN") is encoded with its own `tourney_id`. This would over-count Davis Cup relative to other events.
+
+Therefore, I defined a tournament as a distinct `tourney_id`, **except** that all Davis Cup ties in 2019 are collapsed and counted as **one** “Davis Cup 2019” tournament.
+
+Though some matches took place in 2018, I assumed that they were part of a tournament ending in 2019.
+
+```{r}
+tennis[, tourney_key := fifelse(tourney_level == "D", "2019-M-DC-2019", tourney_id)]
+tennis[, uniqueN(tourney_key)]
+```
+
+Answer: In total, 69 unique tournaments took place in 2019.
+
+**b. Did any player win more than one tournament? If so, how many players won more than one tournament, and how many tournaments did the most winning player(s) win?**
+
+Notes:
+
+Before counting “tournament winners,” I verified which events in this dataset have a single decisive final (`round == "F"`). Laver Cup is a team exhibition with many individual matches and no `round == "F"` row. Davis Cup is also a team event. The “Final” is a tie between two nations made up of multiple rubbers, so there isn’t a single player final (e.g., I found two rows for Davis Cup Finals F: CAN vs ESP).
+
+Therefore, for part (b) I **excluded** Davis Cup and Laver Cup and defined a tournament winner as the winner of the Final in the remaining 67 events.
+
+```{r}
+winners_dt <- tennis[tourney_level != "D" & tourney_name != "Laver Cup" & round == "F",
+                     .(n_tourney = uniqueN(tourney_id)),
+                     by = .(winner_id, winner_name)][n_tourney > 1][order(-n_tourney)]
+```
+
+```{r}
+winners_dt[, .N]
+```
+
+```{r}
+winners_dt[n_tourney == max(n_tourney)]
+```
+
+Answer: Yes, 12 players won more than one tournament; the most winning players (Novak Djokovic and Dominic Thiem) won was 5 tournaments.
+
+**c. Is there any evidence that winners have more aces than losers?**
+
+Note:
+
+I defined the within–match ace–rate difference as
+
+$$
+d_i=\frac{w_{\text{ace},\,i}}{w_{\text{svpt},\,i}}-\frac{l_{\text{ace},\,i}}{l_{\text{svpt},\,i}}
+$$
+
+where $w_{\text{ace},i}$ and $l_{\text{ace},i}$ are the numbers of aces by the winner and loser in each match, and $w_{\text{svpt},i}$ and $l_{\text{svpt},i}$ are their serve-point totals. I computed $d_i$ only for matches with no missing values.
+
+I ran a right-tailed paired t-test with hypotheses
+
+$$
+H_0:\ \mathbb{E}[d_i]=0 \quad\text{vs}\quad H_a:\ \mathbb{E}[d_i]>0
+$$
+
+```{r}
+aces_dt <- tennis[!is.na(w_ace) & !is.na(l_ace) & !is.na(w_svpt) & !is.na(l_svpt),
+                  .(d_rate = (w_ace / w_svpt) - (l_ace / l_svpt))]
+
+t.test(aces_dt$d_rate, alternative = "greater", mu = 0)
+```
+
+Answer: Based on the output, the very small p-value provides strong evidence that winners have a higher ace rate than losers. The point estimate is 0.0294, meaning winners average about 2.94 more aces per 100 serve points than losers.
+
+**d. Identify the player(s) with the highest win-rate. Restrict to players with at least 5 matches.**
+
+```{r}
+players_long <- rbindlist(list(tennis[, .(player_id = winner_id, player_name = winner_name, result = "W")],
+                               tennis[, .(player_id = loser_id, player_name = loser_name, result = "L")]))
+
+player_win <- players_long[, 
+                           .(n_matches = .N, n_wins = sum(result == "W"), win_rate = sum(result == "W") / .N),
+                           by = .(player_id, player_name)][n_matches >= 5][order(-win_rate)]
+
+player_win[1:10, .(player_name, n_matches, n_wins, win_rate = sprintf("%.2f%%", 100 * win_rate))]
+```
+
+Answer: Rafael Nadal had the highest win-rate of 86.96% in 2019.
