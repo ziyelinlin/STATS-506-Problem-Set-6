@@ -7,7 +7,7 @@ format:
 editor: visual
 ---
 
-#### GitHub Repository Link:
+#### GitHub Repository Link: <https://github.com/ziyelinlin/STATS-506-Problem-Set-6.git>
 
 ## Problem 1 - Rcpp
 
