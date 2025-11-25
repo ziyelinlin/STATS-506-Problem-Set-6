@@ -9,13 +9,12 @@ editor: visual
 
 #### GitHub Repository Link:
 
+## Problem 1 - Rcpp
+
 ```{r}
 library(Rcpp)
-library(data.table)
 library(e1071)
 ```
-
-## Problem 1 - Rcpp
 
 In the [notes](https://dept.stat.lsa.umich.edu/~jerrick/courses/stat506_f25/15-rcpp.html), we defined a `C_mean` function. Using this as a template, implement a `C_moment` function that returns the `k`th central moment. Generate a vector of moderate length and show that you are able to **replicate the results** of `e1071::moment`.
 
@@ -54,16 +53,513 @@ dist_list <- list(normal = rnorm(1000, mean = 2, sd = 3),
                   exp = rexp(1000, rate = 2))
 
 lapply(dist_list, function(x) {c(C_moment = C_moment(x, 2), 
-                                 e1071 = e1071::moment(x, order = 2, center = TRUE))})
+                                 e1071 = moment(x, order = 2, center = TRUE))})
 ```
 
 For vectors of 1,000 draws from several distributions (Normal, Uniform, Poisson, Exponential), `C_moment(x, 2)` matches `moment(x, order = 2, center = TRUE)` from the e1071 package.
 
 ## Problem 2 - **Expanding on `waldCI`**
 
+```{r}
+library(parallelly)
+library(parallel)
+library(roxygen2)
+```
+
+a\. Write a class `bootstrapWaldCI` that produces a CI using bootstrap, similar to `waldCI`. It should inherit from `waldCI` using either the version from the solutions or your version - in either case, include the relevant code in this homework by using `source()` on a file containing the `waldCI` code.
+
+```{r}
+source("waldCI.R")
+```
+
+The `booststrapWaldCI` **constructor** should **take in a data set and a function** that **returns a scalar**. Add an **optional** `level` argument and an **optional** `compute` argument that accepts either “serial” (using no parallel processing), “parallel” (using either forks or sockets from **parallel**).
+
+The constructor should carry out the bootstrap **using the requested** `compute` approach. Most functions can be inherited from `waldCI`, but add the additional function `rebootstrap` that performs a new bootstrap. `rebootstrap` should only take in one argument of a `bootstrapWaldCI` object.
+
+Note: Be careful with inheritance and S4:
+
+1.  The `@.Data` slot only applies if the child class contains an S3 class; if it contains S4, it simply adds the child slots alongside the parent slots.
+
+2.  Slot names should not be re-used unless you’re explicitly overwriting existing slots.
+
+```{r class_definition}
+setClass("bootstrapWaldCI",
+         slots = c(stat_fun = "function",
+                   data = "data.frame",
+                   reps = "integer",
+                   compute = "character",
+                   boot_stats = "numeric"),
+         contains = "waldCI")
+```
+
+```{r bootstrap_helper_internal}
+
+#' Internal helper to run a bootstrap
+#'
+#' @description
+#' Computes bootstrap replicates of a scalar statistic, using either
+#' serial computation or a simple parallel implementation via
+#' \code{\link[parallel]{mclapply}}.
+#'
+#' @param fun A function that takes a data set (e.g., a data.frame with
+#'   the same structure as \code{data}) and returns a single numeric
+#'   value for each call.
+#' @param data The original data set to be resampled from (must have at
+#'   least one row).
+#' @param reps Integer scalar; number of bootstrap replications.
+#' @param compute Character string, either \code{"serial"} or
+#'   \code{"parallel"}, indicating whether to use ordinary (serial)
+#'   computation or a parallel version using forks.
+#'
+#' @return A numeric vector of length \code{reps} containing the
+#'   bootstrap replicates of the statistic.
+#'
+#' @details
+#' Each bootstrap replicate is obtained by sampling \code{n} rows with
+#' replacement from \code{data}, where \code{n = nrow(data)}, and then
+#' applying \code{fun} to the resampled data set. This function is for
+#' internal use by \code{\link{makeBootstrapCI}} and
+#' \code{\link{rebootstrap}}.
+#'
+#' @keywords internal
+
+.bootstrap_run <- function(fun, data, reps, compute = c("serial", "parallel")) {
+  compute <- match.arg(compute)
+  reps <- as.integer(reps)
+  
+  n <- nrow(data)
+  if (is.null(n)) stop ("`data` must have at least one row.")
+  
+  one_boot <- function(i) {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    fun(data[idx, , drop = FALSE])
+  }
+  
+  if (compute == "serial") {
+    stats <- sapply(seq_len(reps), one_boot)
+  } else {
+    stats <- unlist(parallel::mclapply(seq_len(reps),
+                                       one_boot,
+                                       mc.cores = max(1L, parallel::detectCores() - 1L)))
+  }
+  as.numeric(stats)
+}
+```
+
+```{r constructor}
+
+#' @title Class \code{bootstrapWaldCI}
+#' 
+#' @description
+#' An S4 class extending \code{\link{waldCI}} that stores a Wald–style
+#' confidence interval constructed from a nonparametric bootstrap.
+#'
+#' @slot stat_fun A function taking a data set (typically a data.frame)
+#'   and returning a single numeric statistic for each bootstrap sample.
+#' @slot data The original data set on which the bootstrap is based.
+#' @slot reps Integer scalar giving the number of bootstrap replications.
+#' @slot compute Character string indicating how the bootstrap was
+#'   computed. Currently either \code{"serial"} (no parallelism) or
+#'   \code{"parallel"} (using functions from \pkg{parallel}).
+#' @slot boot_stats Numeric vector of length \code{reps} containing the
+#'   bootstrap replicates of the statistic.
+#'
+#' @details
+#' The usual Wald–style interval stored in the inherited \code{waldCI}
+#' slots (\code{mean}, \code{sterr}, \code{lb}, \code{ub}, \code{level})
+#' is obtained by treating the bootstrap replicates in \code{boot_stats}
+#' as an approximate sampling distribution of the statistic.
+
+makeBootstrapCI <- function(fun, 
+                            data, 
+                            reps = 1000L, 
+                            level = 0.95, 
+                            compute = c("serial", "parallel")) {
+  compute <- match.arg(compute)
+  reps <- as.integer(reps)
+  
+  # run bootstrap
+  boot_stats <- .bootstrap_run(fun, data, reps, compute)
+  
+  # Wald CI on the bootstrap distribution
+  m <- mean(boot_stats)
+  se <- sd(boot_stats)
+  base <- makeWaldCI(level = level, mean = m, sterr = se)
+  
+  new("bootstrapWaldCI",
+      level = base@level,
+      mean = base@mean,
+      sterr = base@sterr,
+      lb = base@lb,
+      ub = base@ub,
+      stat_fun = fun,
+      data = data,        
+      reps = reps,
+      compute = compute,
+      boot_stats = boot_stats)
+}
+```
+
+```{r}
+#' Re-run the bootstrap for a \code{bootstrapWaldCI} object
+#'
+#' @description
+#' Recomputes the bootstrap distribution for a stored
+#' \code{\linkS4class{bootstrapWaldCI}} object using the original
+#' statistic, data, number of replications, and computation mode
+#' (serial vs. parallel). The Wald-style confidence interval slots
+#' are then updated from the new bootstrap draws.
+#'
+#' @param object A \code{\linkS4class{bootstrapWaldCI}} object created by
+#'   \code{\link{makeBootstrapCI}}.
+#'
+#' @return
+#' The same \code{bootstrapWaldCI} object, modified in place and returned
+#' with updated values in the slots \code{mean}, \code{sterr},
+#' \code{lb}, \code{ub}, and \code{boot_stats}.
+#'
+#' @details
+#' The function calls the internal helper \code{.bootstrap_run()} with
+#' the stored statistic function (\code{stat_fun}), original data,
+#' number of bootstrap replications (\code{reps}), and computation
+#' mode (\code{compute}). A new Wald confidence interval is then
+#' constructed from the mean and standard deviation of the refreshed
+#' bootstrap sample.
+#'
+#' @export
+setGeneric("rebootstrap", function(object) standardGeneric("rebootstrap"))
+
+#' @rdname rebootstrap
+setMethod("rebootstrap", "bootstrapWaldCI",
+          function(object) {
+            # re-run bootstrap with stored settings
+            boot_stats <- .bootstrap_run(fun = object@stat_fun,
+                                         data = object@data,
+                                         reps = object@reps,
+                                         compute = object@compute)
+
+            m <- mean(boot_stats)
+            se <- sd(boot_stats)
+            lvl <- object@level
+            z <- qnorm((1 + lvl) / 2)
+
+            object@mean <- m
+            object@sterr <- se
+            object@lb <- m - z * se
+            object@ub <- m + z * se
+            object@boot_stats <- boot_stats
+
+            validObject(object)
+            object
+          })
+```
+
+b\. Show your code works by executing the following:
+
+```{r}
+ci1 <- makeBootstrapCI(function(x) mean(x$y),
+                       ggplot2::diamonds,
+                       reps = 1000)
+ci1
+rebootstrap(ci1)
+```
+
+Compare and comment on the performance of the two compute methods.
+
+```{r}
+set.seed(1)
+time_serial <- system.time(
+  ci_serial <- makeBootstrapCI(
+    function(x) mean(x$y),
+    ggplot2::diamonds,
+    reps = 1000,
+    compute = "serial"
+  )
+)
+
+time_parallel <- system.time(
+  ci_parallel <- makeBootstrapCI(
+    function(x) mean(x$y),
+    ggplot2::diamonds,
+    reps = 1000,
+    compute = "parallel"
+  )
+)
+
+results <- rbind(
+  serial = time_serial,
+  parallel = time_parallel
+)
+
+results
+```
+
+```{r}
+ci_serial@compute 
+ci_serial
+
+ci_parallel@compute  
+ci_parallel
+```
+
+Answer: With 1000 bootstrap reps on the `diamonds` data set, the parallel version finished noticeably faster than the serial version (a few-fold reduction in elapsed time), although exact timings varied slightly across runs. The confidence intervals produced by the two methods were nearly identical, so using `compute = "parallel"` mainly improves computational speed without changing the statistical result.
+
+c\. Write a function called `dispCoef` that takes in `data` (based upon `mtcars`; it must take in a generic data for the bootstrap) and fits the model: `mpg ~ cyl + disp + wt`. It should return the coefficient associated with `disp`.
+
+```{r}
+#' Coefficient of `disp` in an mpg regression
+#'
+#' @description
+#' Fit the linear model \code{mpg ~ cyl + disp + wt} to a data frame
+#' and return only the coefficient associated with \code{disp}.
+#'
+#' @param data A data frame containing variables \code{mpg}, \code{cyl},
+#'   \code{disp}, and \code{wt} (e.g. \code{mtcars}).
+#'
+#' @return A single numeric value: the estimated regression coefficient
+#'   for \code{disp}.
+
+dispCoef <- function(data) {
+  fit <- lm(mpg ~ cyl + disp + wt, data = data)
+  coef(fit)["disp"]
+}
+```
+
+Execute the following:
+
+```{r}
+ci2 <- makeBootstrapCI(dispCoef,
+                       mtcars,
+                       reps = 1000)
+ci2
+rebootstrap(ci2)
+```
+
+Compare and comment on the performance of the two compute methods.
+
+```{r}
+set.seed(1)
+time_serial <- system.time(
+  ci_serial <- makeBootstrapCI(
+    dispCoef,
+    mtcars,
+    reps = 1000,
+    compute = "serial"
+  )
+)
+
+set.seed(1)
+time_parallel <- system.time(
+  ci_parallel <- makeBootstrapCI(
+    dispCoef,
+    mtcars,
+    reps = 1000,
+    compute = "parallel"
+  )
+)
+
+results <- rbind(
+  serial   = time_serial,
+  parallel = time_parallel
+)
+
+results
+```
+
+```{r}
+ci_serial@compute 
+ci_serial
+
+ci_parallel@compute  
+ci_parallel
+```
+
+Answer: For the `dispCoef` statistic on the `mtcars` data, the serial and parallel compute methods had very similar elapsed times (both around a quarter of a second), with the parallel version only marginally faster in this run. This small difference is expected because `mtcars` is a small data set and fitting `lm(mpg ~ cyl + disp + wt)` is quick, so the overhead of setting up parallel workers largely cancels any speedup. In all cases, the resulting bootstrap Wald confidence intervals for the `disp` coefficient were nearly identical.
+
 ## Problem 3 - **Large data**
 
+```{r}
+library(lme4)
+library(ggplot2)
+library(dplyr)
+```
+
+Generate artificial data by running the code in [this script](https://dept.stat.lsa.umich.edu/~jerrick/courses/stat506_f25/ps06q3.R). Do not include this script in your submitted PDF; either use `source()` or `save`/`load` to get the data into R.
+
+```{r}
+source("large_data.R")
+```
+
+a\. Fit one model per country. Fit a **mixed effects logistic regression** model, predicting **course completion** based upon prior GPA, number of forum posts, number of quiz attempts, and a **random effect** for device type. **Standardize** the predictors **within** each country. Generate some sort of visualization of the **estimated coefficients for number of forum posts** in each country.
+
+Report the **running time** (from `system.time`) for **each** of the 6 models.
+
+Model: `completed_course` \~ `prior_gpa_z` + `forum_posts_z` + `quiz_attempts_z` + `(1 | device_type)`
+
+```{r}
+
+#' Fit one mixed–effects logistic model for a given country
+#'
+#' @description
+#' Subsets the large course data to a single country, standardizes the
+#' predictors within that country, and fits the mixed–effects logistic
+#' regression
+#' \code{completed_course ~ prior_gpa_z + forum_posts_z + quiz_attempts_z + (1 | device_type)}.
+#' The function also records how long the model fit takes.
+#'
+#' @param ctry A single country name (character) matching the values in
+#'   \code{df$country}.
+#'
+#' @return
+#' A list with three elements:
+#' \describe{
+#'   \item{country}{The country name passed in \code{ctry}.}
+#'   \item{fit}{The fitted \code{glmer} model object.}
+#'   \item{time}{The \code{\link{system.time}} result for the model fit.}
+#' }
+
+fit_country_model <- function(ctry) {
+  # subset to one country & standardize within this country 
+  dat <- df %>%
+    filter(country == ctry) %>%
+    mutate(prior_gpa_z = as.numeric(scale(prior_gpa)),
+           forum_posts_z = as.numeric(scale(forum_posts)),
+           quiz_attempts_z = as.numeric(scale(quiz_attempts)))
+  
+  # fit model 
+  t <- system.time({
+    fit <- glmer(
+      completed_course ~ prior_gpa_z + forum_posts_z + quiz_attempts_z + (1 | device_type),
+      data = dat,
+      family = binomial()
+    )
+  })
+  
+  list(country = ctry, fit = fit, time = t)
+}
+```
+
+```{r}
+countries <- levels(df$country)
+fits <- lapply(countries, fit_country_model)
+```
+
+```{r}
+names(fits) <- countries
+time_tbl <- do.call(rbind, lapply(fits, function(x) x$time))
+time_tbl <- rbind(time_tbl, Total = colSums(time_tbl))
+time_tbl
+```
+
+```{r}
+coef_df <- data.frame(
+  country = countries,
+  est = sapply(fits, function(x) {
+    summary(x$fit)$coef["forum_posts_z", "Estimate"]
+  }),
+  se = sapply(fits, function(x) {
+    summary(x$fit)$coef["forum_posts_z", "Std. Error"]
+  })
+)
+
+coef_df$lower <- coef_df$est - 1.96 * coef_df$se
+coef_df$upper <- coef_df$est + 1.96 * coef_df$se
+coef_df
+```
+
+```{r}
+ggplot(coef_df, aes(x = country, y = est)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), 
+                width = 0.1, color = "darkgrey") +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Effect of Forum Posts on Course Completion",
+       subtitle = "(with a 95% confidence interval)",
+       x = NULL,
+       y = NULL) +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(color = "grey"))
+```
+
+b\. Devise an approach that minimizes the running time of your script. Report the running time of your entire script (running models and estimating coefficients; no need for a new plot). Do not use a different package for the models. Show that the results match those from part a).
+
+```{r}
+df_small <- df %>%
+  select(country, completed_course, prior_gpa, forum_posts, quiz_attempts, device_type)
+```
+
+```{r}
+
+#' Fit mixed-effects logistic model for a single country (parallel helper)
+#'
+#' Helper function used in the parallel implementation to fit the mixed
+#' effects logistic regression model for one country. Within the selected
+#' country, the predictors are standardized and a model of the form
+#' \code{completed_course ~ prior_gpa_z + forum_posts_z + quiz_attempts_z +
+#' (1 | device_type)} is fit using \code{\link[lme4]{glmer}}.
+#'
+#' @param ctry Character scalar giving the country label (one of the
+#'   levels of \code{df_small$country}).
+#'
+#' @return An object of class \code{"glmerMod"} containing the fitted model
+#'   for that country.
+#'
+#' @details
+#' This function subsets the global \code{df_small} data frame to the
+#' requested country, standardizes \code{prior_gpa}, \code{forum_posts},
+#' and \code{quiz_attempts} within that subset, then fits a mixed-effects
+#' logistic regression with a random intercept for \code{device_type}.
+
+fit_country_parallel <- function(ctry) {
+  # subset to one country & standardize within this country 
+  dat <- df_small[df_small$country == ctry, ]
+  dat$prior_gpa_z <- as.numeric(scale(dat$prior_gpa))
+  dat$forum_posts_z <- as.numeric(scale(dat$forum_posts))
+  dat$quiz_attempts_z <- as.numeric(scale(dat$quiz_attempts))
+  
+  # fit model
+  glmer(completed_course ~ prior_gpa_z + forum_posts_z + quiz_attempts_z + (1 | device_type),
+        data = dat,
+        family = binomial())
+}
+```
+
+```{r}
+time_parallel <- system.time({
+  fits_parallel <- mclapply(countries,
+                            fit_country_parallel,
+                            mc.cores = max(1L, parallel::detectCores() - 1L))
+})
+time_parallel
+```
+
+```{r}
+coef_df_parallel <- data.frame(
+  country = countries,
+  est = sapply(fits_parallel, function(x) {
+    summary(x)$coef["forum_posts_z", "Estimate"]
+  }),
+  se = sapply(fits_parallel, function(x) {
+    summary(x)$coef["forum_posts_z", "Std. Error"]
+  })
+)
+
+coef_df_parallel$lower <- coef_df_parallel$est - 1.96 * coef_df_parallel$se
+coef_df_parallel$upper <- coef_df_parallel$est + 1.96 * coef_df_parallel$se
+coef_df_parallel
+```
+
+```{r}
+all.equal(coef_df[order(coef_df$country), ],
+          coef_df_parallel[order(coef_df_parallel$country), ],
+          check.attributes = FALSE)
+```
+
 ## Problem 4 - data.table
+
+```{r}
+library(data.table)
+```
 
 Use the **data.table** for this problem. Use the [“ATP Matches” data](https://raw.githubusercontent.com/JeffSackmann/tennis_atp/refs/heads/master/atp_matches_2019.csv). This data tracks all Tennis matches. This data **does not have documentation**, so you’ll have to explore the data yourself to figure out it’s structure. Use it to answer the following questions. Your answers should show both the output from R that allows you to answer it, as well as a written answer.
 
@@ -142,14 +638,21 @@ Answer: Based on the output, the very small p-value provides strong evidence tha
 **d. Identify the player(s) with the highest win-rate. Restrict to players with at least 5 matches.**
 
 ```{r}
-players_long <- rbindlist(list(tennis[, .(player_id = winner_id, player_name = winner_name, result = "W")],
-                               tennis[, .(player_id = loser_id, player_name = loser_name, result = "L")]))
+players_long <- rbindlist(
+  list(tennis[, .(player_id = winner_id, player_name = winner_name, result = "W")],
+       tennis[, .(player_id = loser_id, player_name = loser_name, result = "L")])
+  )
 
 player_win <- players_long[, 
-                           .(n_matches = .N, n_wins = sum(result == "W"), win_rate = sum(result == "W") / .N),
+                           .(n_matches = .N, 
+                             n_wins = sum(result == "W"), 
+                             win_rate = sum(result == "W") / .N),
                            by = .(player_id, player_name)][n_matches >= 5][order(-win_rate)]
 
-player_win[1:10, .(player_name, n_matches, n_wins, win_rate = sprintf("%.2f%%", 100 * win_rate))]
+player_win[1:10, .(player_name, 
+                   n_matches, 
+                   n_wins, 
+                   win_rate = sprintf("%.2f%%", 100 * win_rate))]
 ```
 
 Answer: Rafael Nadal had the highest win-rate of 86.96% in 2019.
