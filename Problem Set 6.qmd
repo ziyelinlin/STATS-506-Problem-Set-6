@@ -483,6 +483,12 @@ ggplot(coef_df, aes(x = country, y = est)) +
 
 b\. Devise an approach that minimizes the running time of your script. Report the running time of your entire script (running models and estimating coefficients; no need for a new plot). Do not use a different package for the models. Show that the results match those from part a).
 
+Note:
+
+To reduce running time, I rewrote the code from part (a) into a parallel version. First, I created `df_small`, which keeps only the variables needed for the model (`country`, `completed_course`, `prior_gpa`, `forum_posts`, `quiz_attempts`, `device_type`). This avoids copying an unnecessarily large data frame inside each fit. I then wrote a helper function `fit_country_parallel(ctry)` that subsets `df_small` to one country using base R indexing rather than tidyverse piping.
+
+Instead of calling this helper sequentially, I used `parallel::mclapply()` over the vector of country labels, with `mc.cores = max(1L, parallel::detectCores() - 1L)` so that the six country-specific models are fit in parallel. I wrapped this call in `system.time()` to measure the total runtime.
+
 ```{r}
 df_small <- df %>%
   select(country, completed_course, prior_gpa, forum_posts, quiz_attempts, device_type)
@@ -554,6 +560,8 @@ all.equal(coef_df[order(coef_df$country), ],
           coef_df_parallel[order(coef_df_parallel$country), ],
           check.attributes = FALSE)
 ```
+
+Answer: In part (a), the sum of the per-country elapsed times was about 170 seconds, whereas the parallel version in part (b) took about 90 seconds, roughly cutting the run time almost in half. I verified that the results match those from part (a) by extracting the `forum_posts_z` coefficients and standard errors from both runs and checking them with `all.equal()`, which confirmed that the estimates are numerically identical.
 
 ## Problem 4 - data.table
 
@@ -656,3 +664,9 @@ player_win[1:10, .(player_name,
 ```
 
 Answer: Rafael Nadal had the highest win-rate of 86.96% in 2019.
+
+**GenAI Disclosure**:
+
+In problem 2, ChatGPT helped me draft roxygen2 documentation for the internal helper `.bootstrap_run`, the `makeBootstrapCI()` constructor, and the `rebootstrap()` method. In particular, it helped me set up the default for the optional `compute` argument using `match.arg(compute)`. For the parallel option, it suggested using `mc.cores = max(1L, parallel::detectCores() - 1L)`so that the bootstrap can use most available cores while leaving at least one core free for the operating system. I think this is a good way, so I did not just write `mc.cores` equal to a specific number.
+
+In problem 3, part (a), the question only asked me to visualize the estimated coefficients for the number of forum posts in each country, but I thought it would be useful to also show the uncertainty around those estimates. ChatGPT helped me figure out how to display the 95% confidence interval for each coefficient it in the plot using `geom_errorbar()`.
